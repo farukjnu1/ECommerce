@@ -1,0 +1,236 @@
+﻿using AutoMapper;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+//using ECommerce.Data;
+using ECommerce.Models;
+using ECommerce.Service.Interface;
+using ECommerce.ViewModels;
+
+namespace ECommerce.Service.Repository
+{
+    public class PurchaseRP : IPurchase
+    {
+        private readonly EcommerceDbContext db;
+        private readonly IMapper mapper;
+
+        public PurchaseRP(EcommerceDbContext db, IMapper mapper)
+        {
+            this.db = db;
+            this.mapper = mapper;
+        }
+
+        public async Task<List<PurchaseVM>> GetAll()
+        {
+            var list = await (from p in db.Purchases
+                              join s in db.Suppliers on p.SupplierId equals s.SupplierId
+                              select new PurchaseVM()
+                              {
+                                  SupplierId = p.SupplierId,
+                                  Description = p.Description,
+                                  GrandTotal = p.GrandTotal,
+                                  SupplierName = s.SupplierName,
+                                  PurchaseId = p.PurchaseId,
+                                  IsApprove = p.IsApprove,
+                              }).ToListAsync();
+            return list;
+        }
+
+        public async Task<PurchaseVM> GetById(int id)
+        {
+            PurchaseVM oPurchase = null; decimal? grandTotal = 0;
+            var purchase = await (from p in db.Purchases
+                                  join s in db.Suppliers on p.SupplierId equals s.SupplierId
+                                  where p.PurchaseId == id
+                                  select new PurchaseVM()
+                                  {
+                                      SupplierId = p.SupplierId,
+                                      Description = p.Description,
+                                      GrandTotal = p.GrandTotal,
+                                      SupplierName = s.SupplierName,
+                                      PurchaseId = p.PurchaseId,
+                                      IsApprove = p.IsApprove,
+                                  }).FirstOrDefaultAsync();
+            if (purchase != null)
+            {
+                var purchasesDetailsList = await (from pd in db.PurchaseDetails
+                                                  join p in db.Products on pd.ProductId equals p.ProductId
+                                                  join s in db.Stores on pd.StoreId equals s.StoreId
+                                                  where pd.PurchaseId == id
+                                                  select new PurchaseDetailVM()
+                                                  {
+                                                      PurchaseDetailId = pd.PurchaseDetailId,
+                                                      Quantity = pd.Quantity,
+                                                      Price = pd.Price,
+                                                      PurchaseId = pd.PurchaseId,
+                                                      ProductId = pd.ProductId,
+                                                      StoreId = pd.StoreId,
+                                                      SubTotal = pd.SubTotal,
+                                                      Vat = pd.Vat,
+                                                      ProductName = p.ProductName,
+                                                      StoreName = s.Name
+                                                  }).ToListAsync();
+                foreach (var item in purchasesDetailsList)
+                {
+                    grandTotal += item.SubTotal;
+                }
+                oPurchase = new PurchaseVM()
+                {
+                    PurchaseId = purchase.PurchaseId,
+                    Description = purchase.Description,
+                    GrandTotal = grandTotal,
+                    IsApprove = purchase.IsApprove,
+                    SupplierId = purchase.SupplierId,
+                    PurchaseDetails = purchasesDetailsList
+                };
+            }
+            return oPurchase;
+        }
+
+        public async Task<PurchaseVM> CreateMaster(PurchaseVM purchaseVM)
+        {
+            try
+            {
+                #region Master insert/update
+                var purchase = await db.Purchases.Where(x => x.PurchaseId == purchaseVM.PurchaseId).FirstOrDefaultAsync();
+                if (purchase == null)
+                {
+                    purchase = new Purchase
+                    {
+                        Description = purchaseVM.Description,
+                        SupplierId = purchaseVM.SupplierId,
+                        GrandTotal = purchaseVM.GrandTotal,
+                        IsApprove = purchaseVM.IsApprove,
+                    };
+                    db.Purchases.Add(purchase);
+                    await db.SaveChangesAsync();
+                    purchaseVM.PurchaseId = purchase.PurchaseId;
+                }
+                else
+                {
+                    purchase.Description = purchaseVM.Description;
+                    purchase.SupplierId = purchaseVM.SupplierId;
+                    purchase.GrandTotal = purchaseVM.GrandTotal;
+                    purchase.IsApprove = purchaseVM.IsApprove;
+                    await db.SaveChangesAsync();
+                }
+                #endregion
+
+                return purchaseVM;
+            }
+            catch (Exception ex)
+            {
+                var ErrorMessage = ex.Message;
+
+                return purchaseVM;
+            }
+        }
+
+        public async Task<PurchaseDetailVM> CreateDetail(PurchaseDetailVM detail)
+        {
+            try
+            {
+                var purchaseDetail = new PurchaseDetail
+                {
+                    PurchaseId = detail.PurchaseId,
+                    ProductId = detail.ProductId,
+                    Quantity = detail.Quantity,
+                    Price = detail.Price,
+                    Vat = detail.Vat,
+                    SubTotal = (detail.Quantity * detail.Price) + detail.Vat,
+                    StoreId = detail.StoreId
+                };
+                db.PurchaseDetails.Add(purchaseDetail);
+                await db.SaveChangesAsync();
+                detail.PurchaseId = purchaseDetail.PurchaseId;
+                detail.PurchaseDetailId = purchaseDetail.PurchaseDetailId;
+                return detail;
+            }
+            catch (Exception ex)
+            {
+                var ErrorMessage = ex.Message;
+                return detail;
+            }
+        }
+
+        public async Task<PurchaseVM> Approve(PurchaseVM purchaseVM)
+        {
+            try
+            {
+                #region Insert Ledger + Update Stock
+                foreach (var detail in purchaseVM.PurchaseDetails)
+                {
+                    Ledger ledger = new Ledger();
+                    ledger.Price = detail.Price;
+                    ledger.Quantity = detail.Quantity;
+                    ledger.InventoryTypeId = 1; // purchase
+                    ledger.StockTypeId = 2; // receive
+                    ledger.StoreId = detail.StoreId;
+                    ledger.ProductId = detail.ProductId;
+                    //ledger.UserId = Login UserID
+                    db.Ledgers.Add(ledger);
+                    await db.SaveChangesAsync();
+
+                    var oStock = (from x in db.Stocks
+                                  where x.ProductId == detail.ProductId && x.StoreId == detail.StoreId
+                                  select x).FirstOrDefault();
+                    if (oStock != null)
+                    {
+                        oStock.ProductId = detail.ProductId;
+                        oStock.Quantity += detail.Quantity;
+                        oStock.StoreId = detail.StoreId;
+                        db.SaveChanges();
+                    }
+                    else
+                    {
+                        Stock stock = new Stock();
+                        stock.ProductId = detail.ProductId;
+                        stock.Quantity = detail.Quantity;
+                        stock.StoreId = detail.StoreId;
+                        db.Add(stock);
+                        db.SaveChanges();
+                    }
+
+                    var purchase = (from x in db.Purchases
+                                    where x.PurchaseId == purchaseVM.PurchaseId
+                                    select x).FirstOrDefault();
+                    if (purchase != null)
+                    {
+                        purchase.IsApprove = true;
+                        db.SaveChanges();
+                    }
+                }
+                #endregion
+                return purchaseVM;
+            }
+            catch (Exception ex)
+            {
+                var ErrorMessage = ex.Message;
+                return purchaseVM;
+            }
+        }
+
+        public async Task<PurchaseDetailVM> RemoveDetail(int detailID)
+        {
+            PurchaseDetailVM purchaseDetailVM = new PurchaseDetailVM();
+            try
+            {
+                var purchaseDetail = await db.PurchaseDetails.Where(x => x.PurchaseId == detailID).FirstOrDefaultAsync();
+                if (purchaseDetail != null)
+                {
+                    db.PurchaseDetails.Remove(purchaseDetail);
+                    await db.SaveChangesAsync();
+                    purchaseDetailVM.PurchaseDetailId = purchaseDetail.PurchaseDetailId;
+                    purchaseDetailVM.PurchaseId = purchaseDetail.PurchaseId;
+                }
+                return purchaseDetailVM;
+            }
+            catch (Exception ex)
+            {
+                var ErrorMessage = ex.Message;
+                //return new BadRequestResult();
+                return purchaseDetailVM;
+            }
+        }
+
+    }
+}
